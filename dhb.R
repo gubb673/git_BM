@@ -27,41 +27,70 @@ library(rgdal) #spatial data wrangling
 library(rgeos) #spatial data wrangling & analytics
 library(tidyverse) # data wrangling
 library(tmap) #modern data visualizations
+library(data.table)
+library(RCurl)
+
+
 
 popupstring = "STREET"
 BoxPlotIndexAttributes ="SYSTEMSTOP"
 
-#read aot data
+#read aot data ---------------------------------
+
+ReadAotData<-function(ExtraDate,ThisWorkPath)
+{
+  DataType = c("complete","public")
+  #DateRangType <- c("daily","monthly") #the monthly and weekly data is difference
+  if(is.Date(ExtraDate))
+  {
+    #get the name
+    
+    DateText <- format(ExtraDate, format = "%Y-%m-%d"); 
+    
+    FileNameWithoutExt<-paste0("chicago-",DataType[1],".daily.",DateText)
+    FileName<-paste0("chicago-",DataType[1],".daily.",DateText,".tar")
+    AotDateUrl <- paste0("https://s3.amazonaws.com/aot-tarballs/",FileName)
+    SaveUrl <-paste0(ThisWorkPath,FileName) #Aot Chicago Public Daily
+    file.path <- c(AotDateUrl)
+    file.dest <- c(SaveUrl)
+    if(!file.exists(file.dest)){
+      download.file(file.path, file.dest,method="curl")
+      if(file.info(file.dest)$size<1500)
+      {
+        pc <<- list(DWS = FALSE)
+        return(pc)
+      }
+      untar(file.dest,exdir=ThisWorkPath)
+    }
+    if(file.info(file.dest)$size<1500)
+    {
+      pc <<- list(DWS = FALSE)
+      return(pc)
+    }
+    outupt.data <- read.csv(paste0(ThisWorkPath,FileNameWithoutExt,"/data.csv.gz"))
+    outupt.provenance <<- read.csv(paste0(ThisWorkPath,FileNameWithoutExt,"/provenance.csv"))
+    outupt.info <- read.csv(paste0(ThisWorkPath,FileNameWithoutExt,"/sensors.csv"))
+    outupt.nodes <- read.csv(paste0(ThisWorkPath,FileNameWithoutExt,"/nodes.csv"))
+    outupt.chiCA <- st_read(paste0(ThisWorkPath,"ChiComArea.shp"))
+    outupt.nodes.spt <- SpatialPointsDataFrame(outupt.nodes[,c('lon','lat')],outupt.nodes)
+    outupt.prjN <- proj4string(outupt.nodes.spt) <- CRS("+init=epsg:4326")
+    
+  
+    pc <- list ( DWS = TRUE, data = outupt.data, provenance = outupt.provenance,info= outupt.info,nodes = outupt.nodes, spatialpolygon = outupt.chiCA, spt = outupt.nodes.spt, prjN = outupt.prjN)
+    setDT(pc$data)
+    setDT(pc$nodes)
+  }
+  return(pc)
+}
 
 
-# ReadAotData <-function(ExtraDate){
-#   #test if it is a date
-#   req(is.Date(ExtraDate))
-#   #get the name
-#   DateText <- format(ExtraDate, format = "%Y-%m-%d"); 
-#   AotDateUrl <- paste0("https://s3.amazonaws.com/aot-tarballs/chicago-public.daily.",DateText,".tar")
-#   SaveUrl <-paste0("AotCPD_",DateText,".tar") #Aot Chicago Public Daily
-#   file.path <- c(AotDateUrl)
-#   file.dest <- c(SaveUrl)
-#   if(!file.exists(file.dest)){
-#     download.file(file.path, file.dest)
-#     untar(file.dest)
-#   }
-#   sensor.data <- read.csv("data.csv.gz")
-#   provenance <- read.csv("provenance.csv")
-#   sensor.info <- read.csv("sensors.csv")
-#   chiCA <- readOGR(".","ChiComArea")
-#   nodes.spt <- SpatialPointsDataFrame(nodes[,c('lon','lat')],nodes)
-#   proj4string(nodes.spt) <- CRS("+init=epsg:4326")
-#   
-# }
 
-
+#basic ------------------------
 
 #input data
 nc <- st_read("F://Dianaprince//Bloomberg//CBSWithTestField.shp")
 nc$OBJID <- seq.int(nrow(nc))
-
+SRAot <-list(DWS = FALSE)# the default Search Result of Aot Data
 #SelectedList
 IndexofSelectRect = 0;
 Sell<-list()
@@ -69,9 +98,10 @@ vi=1;
 
 #the drawned and intersected selection area. this might be infeasible for a multilayer case
 Drawned <-1 
+SearchResult <- c(1,1)
+RenderTab<-FALSE
 
-
-#set ui
+#set ui -----------------
 ui <- dashboardPage(
   skin = "red",
   dashboardHeader(title = "Basic dashboard"),
@@ -142,12 +172,24 @@ ui <- dashboardPage(
       ),
       box(
         leafletOutput("TMAP_TEST")
+      ),
+      box(
+        actionButton("DWLDAot","Download Aot Data"),
+        dateInput('DownloadDate',
+                  label = 'Date input: yyyy-mm-dd',
+                  value = Sys.Date()
+        ),
+        selectInput("AotField","AotField",c("Node_id","Value")),
+        actionButton("VisAot","Visualize Aot Data"),
+        DT::dataTableOutput("visAot_Text")
       )
       
       
     )
   )
 )
+
+#set server -----------------
 
 server <- function(input, output,session) {
   set.seed(122)
@@ -201,7 +243,7 @@ server <- function(input, output,session) {
       return(qk_intersect_test) 
     
   }
-  
+ 
   output$TMAP_TEST = renderLeaflet({
     
     req(is.numeric(nc[[input$column]]))
@@ -352,6 +394,29 @@ server <- function(input, output,session) {
     dygraph(discharge_timeSeries)%>% dyRangeSelector()
     
   })
+  
+  observeEvent(input$DWLDAot,{
+    #download data at given date
+    SRAot <<- ReadAotData(input$DownloadDate,"F:/Dianaprince/Bloomberg/")
+    req(SRAot$DWS)
+    print(paste0("Data loaded",as.character(input$DownloadDate),as.character(SRAot$DWS)))
+    vq <- SRAot$data[,.(.N),by=.(parameter)]
+    updateSelectInput(session,"AotField", choices = as.character(vq$parameter))
+  })
+  
+  UpdateSelectedResult<-eventReactive(input$VisAot, {
+    
+    req(SRAot$DWS)
+    SearchCode<<-paste0("SRAot$data[parameter == '",input$AotField,"' & !is.na(value_raw),.(median(as.numeric(as.character(value_hrf)))),by = .(node_id)]")
+    SearchResult<<-eval(parse(text = SearchCode))
+    SearchResult
+
+  })
+  
+  
+  output$visAot_Text <- DT::renderDataTable(UpdateSelectedResult())
+  
+  
   
   output$SelectedPointsFromPlotly <- renderPrint({
     NowSelected <<- event_data("plotly_selected", source = "PointSelected")
